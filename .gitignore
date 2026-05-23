@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+
+docs/
+
+data/*
+!data/hood/
+data/hood/*
+!data/hood/SIM_geo_005_clusterID_2_crvCount_1_0938_cd_0.022_md_0.030_08.stl
+!data/hood/SIM_geo_109_clusterID_8_crvCount_2_0218_1435_cd_0.025_md_0.041_08.stl
