@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """Gradio MVP for CAD-A depth ICP and CAD-B same-view rendering."""
 
+# """
+#   cd /mount/moritadbjp/sharefilesjp/work/poseR6D
+#   .venv/bin/python scripts/take_icp_gradio_app.py --host 127.0.0.1
+# """
+
 from __future__ import annotations
 
 import argparse
@@ -55,11 +60,25 @@ def format_exception(exc: BaseException) -> str:
 
 @dataclass
 class PipelineResult:
-    image: Any
+    image_step0: Any
+    image_final: Any
+    final_step: int
     depth_image: Any
     pose_json: str
     score_json: str
     log: str
+
+
+@dataclass
+class ICPResult:
+    transformation: Any
+    fitness: float
+    inlier_rmse: float
+    final_step: int
+    converged: bool
+    rmse_delta: float | None
+    last_delta_rotation_deg: float
+    last_delta_translation_norm: float
 
 
 def matrix_to_list(T):
@@ -75,6 +94,16 @@ def pointcloud_bounds(pcd):
         "min": points.min(axis=0).round(6).tolist(),
         "max": points.max(axis=0).round(6).tolist(),
     }
+
+
+def transform_delta_metrics(T):
+    n = np()
+    matrix = n.asarray(T, dtype=float)
+    R = matrix[:3, :3]
+    cos_angle = max(min((float(n.trace(R)) - 1.0) * 0.5, 1.0), -1.0)
+    rotation_deg = math.degrees(math.acos(cos_angle))
+    translation_norm = float(n.linalg.norm(matrix[:3, 3]))
+    return rotation_deg, translation_norm
 
 
 def create_camera_intrinsics(fx: float, fy: float, cx: float, cy: float):
@@ -188,6 +217,38 @@ def mesh_bounds(mesh):
     return min_xyz, max_xyz, center, max(radius, 1e-6)
 
 
+def create_xy_front_camera_pose(mesh, distance_multiplier: float = 3.0):
+    n = np()
+    _, _, bbox_center, bbox_radius = mesh_bounds(mesh)
+    distance = max(float(distance_multiplier), 1e-6) * bbox_radius
+    eye = bbox_center + n.array([0.0, 0.0, distance], dtype=float)
+    up = n.array([0.0, 1.0, 0.0], dtype=float)
+    return create_camera_pose_from_eye_target_up(eye, bbox_center, up)
+
+
+def create_six_view_camera_poses(mesh, distance_multiplier: float = 3.0):
+    n = np()
+    _, _, bbox_center, bbox_radius = mesh_bounds(mesh)
+    distance = max(float(distance_multiplier), 1e-6) * bbox_radius
+    specs = [
+        ("XY +Z", n.array([0.0, 0.0, 1.0]), n.array([0.0, 1.0, 0.0])),
+        ("XY -Z", n.array([0.0, 0.0, -1.0]), n.array([0.0, 1.0, 0.0])),
+        ("YZ +X", n.array([1.0, 0.0, 0.0]), n.array([0.0, 0.0, 1.0])),
+        ("YZ -X", n.array([-1.0, 0.0, 0.0]), n.array([0.0, 0.0, 1.0])),
+        ("ZX +Y", n.array([0.0, 1.0, 0.0]), n.array([0.0, 0.0, 1.0])),
+        ("ZX -Y", n.array([0.0, -1.0, 0.0]), n.array([0.0, 0.0, 1.0])),
+    ]
+    return [
+        {
+            "name": name,
+            "pose": create_camera_pose_from_eye_target_up(
+                bbox_center + direction * distance, bbox_center, up
+            ),
+        }
+        for name, direction, up in specs
+    ]
+
+
 def create_camera_pose_from_plotly_view(view_state_json: str | None, mesh, fallback_pose):
     n = np()
     if not view_state_json or not str(view_state_json).strip():
@@ -235,6 +296,18 @@ def create_camera_pose_from_plotly_view(view_state_json: str | None, mesh, fallb
         )
     except Exception as exc:
         return fallback_pose, f"fallback numeric camera: invalid preview view state ({format_exception(exc)})"
+
+
+def preview_state_value(view_state_json: str | None, key: str, default: Any = None):
+    if not view_state_json or not str(view_state_json).strip():
+        return default
+    try:
+        state = json.loads(view_state_json)
+    except Exception:
+        return default
+    if not isinstance(state, dict):
+        return default
+    return state.get(key, default)
 
 
 def opencv_to_opengl_camera_pose(T_object_camera):
@@ -753,6 +826,96 @@ def run_point_to_plane_icp(source_pcd, target_pcd, max_distance: float, max_iter
     return result.transformation, float(result.fitness), float(result.inlier_rmse)
 
 
+def run_point_to_point_icp(source_pcd, target_pcd, max_distance: float, max_iteration: int):
+    n = np()
+    open3d = require_module("open3d")
+    result = open3d.pipelines.registration.registration_icp(
+        source_pcd,
+        target_pcd,
+        float(max_distance),
+        n.eye(4),
+        open3d.pipelines.registration.TransformationEstimationPointToPoint(),
+        open3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=int(max_iteration)),
+    )
+    return result.transformation, float(result.fitness), float(result.inlier_rmse)
+
+
+def run_iterative_icp(
+    source_pcd,
+    target_pcd,
+    max_distance: float,
+    max_iteration: int,
+    min_steps: int,
+    rmse_tol: float,
+    rot_tol_deg: float,
+    trans_tol: float,
+    mode: str,
+) -> ICPResult:
+    n = np()
+    open3d = require_module("open3d")
+    if mode == "point_to_plane":
+        if not target_pcd.has_normals():
+            raise ValueError("Target point cloud needs normals for point-to-plane ICP.")
+        estimation = open3d.pipelines.registration.TransformationEstimationPointToPlane()
+    elif mode == "point_to_point":
+        estimation = open3d.pipelines.registration.TransformationEstimationPointToPoint()
+    else:
+        raise ValueError(f"Unsupported ICP mode: {mode}")
+
+    max_iteration = max(1, int(max_iteration))
+    min_steps = max(1, int(min_steps))
+    current = source_pcd
+    total_transform = n.eye(4)
+    prev_rmse = None
+    rmse_delta = None
+    last_delta_rotation_deg = float("inf")
+    last_delta_translation_norm = float("inf")
+    fitness = 0.0
+    inlier_rmse = float("inf")
+    converged = False
+    final_step = 0
+
+    for step in range(1, max_iteration + 1):
+        result = open3d.pipelines.registration.registration_icp(
+            current,
+            target_pcd,
+            float(max_distance),
+            n.eye(4),
+            estimation,
+            open3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=1),
+        )
+        step_transform = n.asarray(result.transformation, dtype=float)
+        current = transform_pointcloud(current, step_transform)
+        total_transform = step_transform @ total_transform
+        fitness = float(result.fitness)
+        inlier_rmse = float(result.inlier_rmse)
+        if prev_rmse is not None and math.isfinite(prev_rmse) and math.isfinite(inlier_rmse):
+            rmse_delta = abs(prev_rmse - inlier_rmse)
+        last_delta_rotation_deg, last_delta_translation_norm = transform_delta_metrics(step_transform)
+        final_step = step
+        if (
+            step >= min_steps
+            and rmse_delta is not None
+            and rmse_delta < float(rmse_tol)
+            and last_delta_rotation_deg < float(rot_tol_deg)
+            and last_delta_translation_norm < float(trans_tol)
+        ):
+            converged = True
+            break
+        prev_rmse = inlier_rmse
+
+    return ICPResult(
+        transformation=total_transform,
+        fitness=fitness,
+        inlier_rmse=inlier_rmse,
+        final_step=final_step,
+        converged=converged,
+        rmse_delta=rmse_delta,
+        last_delta_rotation_deg=last_delta_rotation_deg,
+        last_delta_translation_norm=last_delta_translation_norm,
+    )
+
+
 def transfer_pose_to_cad_b(T_A_C, T_BA, scale: float = 1.0):
     n = np()
     T_B_C = n.asarray(T_BA, dtype=float) @ n.asarray(T_A_C, dtype=float)
@@ -786,6 +949,125 @@ def _json_dumps(data: Any) -> str:
     return json.dumps(data, ensure_ascii=False, indent=2)
 
 
+def run_icp_candidate(
+    name: str,
+    P_obs_C,
+    target,
+    mesh,
+    T_A_C_initial,
+    voxel_size: float,
+    max_correspondence_distance: float,
+    max_iteration: int,
+    min_steps: int,
+    rmse_tol: float,
+    rot_tol_deg: float,
+    trans_tol: float,
+    use_coarse: bool,
+    perturb_xyz: tuple[float, float, float],
+):
+    _, _, _, bbox_radius = mesh_bounds(mesh)
+    effective_trans_tol = float(trans_tol)
+    if effective_trans_tol <= 0:
+        effective_trans_tol = bbox_radius * 1e-4
+    max_iteration_total = max(1, int(max_iteration))
+
+    P_obs_A = transform_pointcloud(P_obs_C, T_A_C_initial)
+    if any(abs(v) > 0 for v in perturb_xyz):
+        P_obs_A = transform_pointcloud(P_obs_A, create_small_translation(*perturb_xyz))
+    source = preprocess_pointcloud(P_obs_A, float(voxel_size))
+
+    coarse_result = None
+    if use_coarse:
+        coarse_distance = max(float(max_correspondence_distance), bbox_radius * 1.5)
+        coarse_iterations = min(max(1, max_iteration_total // 2), max_iteration_total - 1)
+        if coarse_iterations > 0:
+            coarse_result = run_iterative_icp(
+                source,
+                target,
+                coarse_distance,
+                coarse_iterations,
+                min_steps=1,
+                rmse_tol=float(rmse_tol),
+                rot_tol_deg=float(rot_tol_deg),
+                trans_tol=effective_trans_tol,
+                mode="point_to_point",
+            )
+            source = transform_pointcloud(source, coarse_result.transformation)
+
+    remaining_iterations = max_iteration_total
+    if coarse_result is not None:
+        remaining_iterations = max(1, max_iteration_total - coarse_result.final_step)
+    fine_result = run_iterative_icp(
+        source,
+        target,
+        float(max_correspondence_distance),
+        remaining_iterations,
+        int(min_steps),
+        float(rmse_tol),
+        float(rot_tol_deg),
+        effective_trans_tol,
+        mode="point_to_plane",
+    )
+
+    if coarse_result is None:
+        T_A_Aobs = fine_result.transformation
+        final_step = fine_result.final_step
+    else:
+        T_A_Aobs = fine_result.transformation @ coarse_result.transformation
+        final_step = coarse_result.final_step + fine_result.final_step
+    delta_rotation_deg, delta_translation_norm = transform_delta_metrics(T_A_Aobs)
+    return {
+        "name": name,
+        "T_A_C_initial": T_A_C_initial,
+        "T_A_Aobs": T_A_Aobs,
+        "T_A_C_refined": T_A_Aobs @ T_A_C_initial,
+        "converged": fine_result.converged,
+        "final_step": final_step,
+        "max_iteration": max_iteration_total,
+        "coarse_step": coarse_result.final_step if coarse_result is not None else 0,
+        "fine_step": fine_result.final_step,
+        "stop_reason": "converged" if fine_result.converged else "max_iteration",
+        "fitness": fine_result.fitness,
+        "inlier_rmse": fine_result.inlier_rmse,
+        "rmse_delta": fine_result.rmse_delta,
+        "last_delta_rotation_deg": fine_result.last_delta_rotation_deg,
+        "last_delta_translation_norm": fine_result.last_delta_translation_norm,
+        "delta_rotation_deg": delta_rotation_deg,
+        "delta_translation_norm": delta_translation_norm,
+    }
+
+
+def select_best_icp_candidate(candidates: list[dict[str, Any]]):
+    def key(candidate):
+        rmse = candidate["inlier_rmse"]
+        if not math.isfinite(float(rmse)):
+            rmse = float("inf")
+        return (
+            0 if candidate["converged"] else 1,
+            float(rmse),
+            -float(candidate["fitness"]),
+            int(candidate["final_step"]),
+        )
+
+    return min(candidates, key=key)
+
+
+def candidate_score_summary(candidate: dict[str, Any]):
+    return {
+        "name": candidate["name"],
+        "converged": candidate["converged"],
+        "final_step": candidate["final_step"],
+        "coarse_step": candidate["coarse_step"],
+        "fine_step": candidate["fine_step"],
+        "stop_reason": candidate["stop_reason"],
+        "fitness": candidate["fitness"],
+        "inlier_rmse": candidate["inlier_rmse"],
+        "rmse_delta": candidate["rmse_delta"],
+        "last_delta_rotation_deg": candidate["last_delta_rotation_deg"],
+        "last_delta_translation_norm": candidate["last_delta_translation_norm"],
+    }
+
+
 def run_pipeline(
     cad_a_file,
     cad_b_file,
@@ -806,6 +1088,10 @@ def run_pipeline(
     voxel_size: float,
     max_correspondence_distance: float,
     max_iteration: int,
+    min_steps: int,
+    rmse_tol: float,
+    rot_tol_deg: float,
+    trans_tol: float,
     n_points: int,
     t_ba_json: str,
     scale: float,
@@ -841,12 +1127,19 @@ def run_pipeline(
         mesh_b = load_mesh(cad_b_path)
         append_log(logs, f"CAD-A vertices={len(mesh_a.vertices)} faces={len(mesh_a.faces)}")
         append_log(logs, f"CAD-B vertices={len(mesh_b.vertices)} faces={len(mesh_b.faces)}")
-        T_A_C_initial, view_message = create_camera_pose_from_plotly_view(
+        T_A_C_depth, view_message = create_camera_pose_from_plotly_view(
             preview_view_json, mesh_a, fallback_T_A_C
         )
         append_log(logs, view_message)
+        T_A_C_initial = T_A_C_depth
+        b_initial_mode = preview_state_value(preview_view_json, "b_initial_mode", "preview")
+        if b_initial_mode == "xy_front":
+            T_A_C_initial = create_xy_front_camera_pose(mesh_a, float(distance))
+            append_log(logs, f"CAD-B/ICP initial camera: xy_front distance_multiplier={float(distance):.4f}")
+        else:
+            append_log(logs, "CAD-B/ICP initial camera: preview")
 
-        depth = render_depth(mesh_a, T_A_C_initial, K, int(width), int(height))
+        depth = render_depth(mesh_a, T_A_C_depth, K, int(width), int(height))
         valid_depth = int((np().asarray(depth) > 0).sum())
         if valid_depth < 10:
             raise ValueError("Rendered depth has too few valid pixels. Check camera distance and target.")
@@ -867,31 +1160,98 @@ def run_pipeline(
         append_log(logs, f"source points after preprocess={len(source.points)}")
         append_log(logs, f"target points after preprocess={len(target.points)}")
 
-        T_A_Aobs, fitness, rmse = run_point_to_plane_icp(
-            source, target, float(max_correspondence_distance), int(max_iteration)
+        _, _, _, bbox_radius = mesh_bounds(mesh_a)
+        effective_trans_tol = float(trans_tol)
+        if effective_trans_tol <= 0:
+            effective_trans_tol = bbox_radius * 1e-4
+        max_iteration_total = max(1, int(max_iteration))
+        coarse_result = None
+        if b_initial_mode == "xy_front":
+            coarse_distance = max(float(max_correspondence_distance), bbox_radius * 1.5)
+            coarse_iterations = min(max(1, max_iteration_total // 2), max_iteration_total - 1)
+            if coarse_iterations > 0:
+                coarse_result = run_iterative_icp(
+                    source,
+                    target,
+                    coarse_distance,
+                    coarse_iterations,
+                    min_steps=1,
+                    rmse_tol=float(rmse_tol),
+                    rot_tol_deg=float(rot_tol_deg),
+                    trans_tol=effective_trans_tol,
+                    mode="point_to_point",
+                )
+                source = transform_pointcloud(source, coarse_result.transformation)
+                append_log(
+                    logs,
+                    "coarse ICP "
+                    f"step={coarse_result.final_step} distance={coarse_distance:.6f} "
+                    f"fitness={coarse_result.fitness:.6f} "
+                    f"inlier_rmse={coarse_result.inlier_rmse:.6f}",
+                )
+        remaining_iterations = max_iteration_total
+        if coarse_result is not None:
+            remaining_iterations = max(1, max_iteration_total - coarse_result.final_step)
+        fine_result = run_iterative_icp(
+            source,
+            target,
+            float(max_correspondence_distance),
+            remaining_iterations,
+            int(min_steps),
+            float(rmse_tol),
+            float(rot_tol_deg),
+            effective_trans_tol,
+            mode="point_to_plane",
         )
+        if coarse_result is None:
+            T_A_Aobs = fine_result.transformation
+            final_step = fine_result.final_step
+        else:
+            T_A_Aobs = fine_result.transformation @ coarse_result.transformation
+            final_step = coarse_result.final_step + fine_result.final_step
+        T_B_C_step0 = transfer_pose_to_cad_b(T_A_C_initial, T_BA, float(scale))
         T_A_C_refined = T_A_Aobs @ T_A_C_initial
         T_B_C = transfer_pose_to_cad_b(T_A_C_refined, T_BA, float(scale))
-        append_log(logs, f"ICP fitness={fitness:.6f} inlier_rmse={rmse:.6f}")
+        delta_rotation_deg, delta_translation_norm = transform_delta_metrics(T_A_Aobs)
+        append_log(
+            logs,
+            f"ICP final_step={final_step} converged={fine_result.converged} "
+            f"fitness={fine_result.fitness:.6f} inlier_rmse={fine_result.inlier_rmse:.6f} "
+            f"rmse_delta={fine_result.rmse_delta} "
+            f"delta_rotation_deg={delta_rotation_deg:.6f} "
+            f"delta_translation_norm={delta_translation_norm:.6f}",
+        )
 
-        image = render_rgb(mesh_b, T_B_C, K, int(width), int(height))
+        image_step0 = render_rgb(mesh_b, T_B_C_step0, K, int(width), int(height))
+        image_final = render_rgb(mesh_b, T_B_C, K, int(width), int(height))
         pose = {
+            "T_A_C_depth": matrix_to_list(T_A_C_depth),
             "T_A_C_initial": matrix_to_list(T_A_C_initial),
             "T_A_Aobs_icp": matrix_to_list(T_A_Aobs),
             "T_A_C_refined": matrix_to_list(T_A_C_refined),
             "T_BA": matrix_to_list(T_BA),
+            "T_B_C_step0": matrix_to_list(T_B_C_step0),
             "T_B_C": matrix_to_list(T_B_C),
             "K": matrix_to_list(K),
         }
         scores = {
-            "fitness": fitness,
-            "inlier_rmse": rmse,
-            "valid_depth_pixels": valid_depth,
-            "source_points": len(source.points),
-            "target_points": len(target.points),
+            "converged": fine_result.converged,
+            "final_step": final_step,
+            "max_iteration": max_iteration_total,
+            "coarse_step": coarse_result.final_step if coarse_result is not None else 0,
+            "fine_step": fine_result.final_step,
+            "stop_reason": "converged" if fine_result.converged else "max_iteration",
+            "fitness": fine_result.fitness,
+            "inlier_rmse": fine_result.inlier_rmse,
+            "rmse_delta": fine_result.rmse_delta,
+            "last_delta_rotation_deg": fine_result.last_delta_rotation_deg,
+            "last_delta_translation_norm": fine_result.last_delta_translation_norm,
+            "initial_mode": b_initial_mode,
         }
         return PipelineResult(
-            image=image,
+            image_step0=image_step0,
+            image_final=image_final,
+            final_step=final_step,
             depth_image=depth_image,
             pose_json=_json_dumps(pose),
             score_json=_json_dumps(scores),
@@ -899,7 +1259,15 @@ def run_pipeline(
         )
     except Exception as exc:
         append_log(logs, format_exception(exc))
-        return PipelineResult(image=None, depth_image=None, pose_json="{}", score_json="{}", log="\n".join(logs))
+        return PipelineResult(
+            image_step0=None,
+            image_final=None,
+            final_step=0,
+            depth_image=None,
+            pose_json="{}",
+            score_json="{}",
+            log="\n".join(logs),
+        )
 
 
 def run_self_test(mesh_path: str | None = None) -> int:
@@ -932,6 +1300,12 @@ def run_self_test(mesh_path: str | None = None) -> int:
         point_count = len(pcd.points)
         if point_count != 256:
             raise AssertionError(f"Unexpected sampled point count: {point_count}")
+        six_views = create_six_view_camera_poses(mesh)
+        if len(six_views) != 6:
+            raise AssertionError(f"Unexpected six-view candidate count: {len(six_views)}")
+        for candidate in six_views:
+            if np().asarray(candidate["pose"]).shape != (4, 4):
+                raise AssertionError(f"Invalid pose shape for {candidate['name']}")
         append_log(logs, f"mesh vertices={len(mesh.vertices)} faces={len(mesh.faces)} sampled={point_count}")
 
     print("\n".join(logs))
@@ -971,6 +1345,11 @@ def build_gradio_app():
                     voxel_size = gr.Number(label="voxel_size", value=0.02)
                     max_correspondence_distance = gr.Number(label="max_correspondence_distance", value=0.08)
                     max_iteration = gr.Number(label="max_iteration", value=40, precision=0)
+                    min_steps = gr.Number(label="min_steps", value=5, precision=0)
+                    with gr.Row():
+                        rmse_tol = gr.Number(label="rmse_tol", value=1e-5)
+                        rot_tol_deg = gr.Number(label="rot_tol_deg", value=0.05)
+                        trans_tol = gr.Number(label="trans_tol (0=auto)", value=0.0)
                     n_points = gr.Number(label="cad sample points", value=20000, precision=0)
                 with gr.Accordion("Transfer and debug", open=False):
                     t_ba_json = gr.Textbox(
@@ -984,13 +1363,17 @@ def build_gradio_app():
                         perturb_x = gr.Number(label="perturb_x", value=0.0)
                         perturb_y = gr.Number(label="perturb_y", value=0.0)
                         perturb_z = gr.Number(label="perturb_z", value=0.0)
-                start = gr.Button("Start", variant="primary")
+                with gr.Row():
+                    start = gr.Button("Start", variant="primary")
+                    start_xy_front = gr.Button("Run XY Front ICP")
             with gr.Column():
                 cad_b_file = gr.File(label="CAD-B")
-                image = gr.Image(label="CAD-B same-view rendering", type="numpy")
-                pose_json = gr.Code(label="Pose", language="json")
+                with gr.Row():
+                    image_step0 = gr.Image(label="CAD-B Step=0", type="numpy")
+                    image_final = gr.Image(label="CAD-B Final (Step=n)", type="numpy")
+                pose_json = gr.Code(label="Pose", language="json", visible=False)
                 score_json = gr.Code(label="ICP score", language="json")
-                log = gr.Textbox(label="Log", lines=16)
+                log = gr.Textbox(label="Log", lines=16, visible=False)
 
         inputs = [
             cad_a_file,
@@ -1012,6 +1395,10 @@ def build_gradio_app():
             voxel_size,
             max_correspondence_distance,
             max_iteration,
+            min_steps,
+            rmse_tol,
+            rot_tol_deg,
+            trans_tol,
             n_points,
             t_ba_json,
             scale,
@@ -1023,7 +1410,14 @@ def build_gradio_app():
 
         def _run(*values):
             result = run_pipeline(*values)
-            return result.depth_image, result.image, result.pose_json, result.score_json, result.log
+            return (
+                result.depth_image,
+                result.image_step0,
+                gr.update(value=result.image_final, label=f"CAD-B Final (Step={result.final_step})"),
+                result.pose_json,
+                result.score_json,
+                result.log,
+            )
 
         capture_preview_camera_js = """
         (...args) => {
@@ -1066,19 +1460,29 @@ def build_gradio_app():
             const state = {
                 source: "plotly",
                 camera,
+                b_initial_mode: "preview",
                 captured_at: new Date().toISOString()
             };
             args[args.length - 1] = JSON.stringify(state);
             return args;
         }
         """
+        capture_preview_camera_xy_front_js = capture_preview_camera_js.replace(
+            'b_initial_mode: "preview"', 'b_initial_mode: "xy_front"'
+        )
 
         cad_a_file.change(update_cad_a_preview, inputs=[cad_a_file], outputs=[cad_a_plot, log])
         start.click(
             _run,
             inputs=inputs,
-            outputs=[cad_a_depth, image, pose_json, score_json, log],
+            outputs=[cad_a_depth, image_step0, image_final, pose_json, score_json, log],
             js=capture_preview_camera_js,
+        )
+        start_xy_front.click(
+            _run,
+            inputs=inputs,
+            outputs=[cad_a_depth, image_step0, image_final, pose_json, score_json, log],
+            js=capture_preview_camera_xy_front_js,
         )
     return demo
 
