@@ -3,7 +3,7 @@
 
 # """
 #   cd /mount/moritadbjp/sharefilesjp/work/poseR6D
-#   .venv/bin/python scripts/take_icp_gradio_app.py --host 127.0.0.1
+#   .venv/bin/python scripts/take_icp_gradio_app.py --host 0.0.0.0 --port 7866
 # """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ import signal
 import subprocess
 import sys
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -63,6 +64,8 @@ class PipelineResult:
     image_step0: Any
     image_final: Any
     final_step: int
+    selected_candidate: str
+    total_delta_rotation_deg: float
     depth_image: Any
     pose_json: str
     score_json: str
@@ -74,6 +77,7 @@ class ICPResult:
     transformation: Any
     fitness: float
     inlier_rmse: float
+    registration_valid: bool
     final_step: int
     converged: bool
     rmse_delta: float | None
@@ -232,7 +236,6 @@ def create_six_view_camera_poses(mesh, distance_multiplier: float = 3.0):
     distance = max(float(distance_multiplier), 1e-6) * bbox_radius
     specs = [
         ("XY +Z", n.array([0.0, 0.0, 1.0]), n.array([0.0, 1.0, 0.0])),
-        ("XY -Z", n.array([0.0, 0.0, -1.0]), n.array([0.0, 1.0, 0.0])),
         ("YZ +X", n.array([1.0, 0.0, 0.0]), n.array([0.0, 0.0, 1.0])),
         ("YZ -X", n.array([-1.0, 0.0, 0.0]), n.array([0.0, 0.0, 1.0])),
         ("ZX +Y", n.array([0.0, 1.0, 0.0]), n.array([0.0, 0.0, 1.0])),
@@ -872,6 +875,7 @@ def run_iterative_icp(
     last_delta_translation_norm = float("inf")
     fitness = 0.0
     inlier_rmse = float("inf")
+    registration_valid = False
     converged = False
     final_step = 0
 
@@ -889,12 +893,14 @@ def run_iterative_icp(
         total_transform = step_transform @ total_transform
         fitness = float(result.fitness)
         inlier_rmse = float(result.inlier_rmse)
+        registration_valid = fitness > 1e-6 and math.isfinite(inlier_rmse)
         if prev_rmse is not None and math.isfinite(prev_rmse) and math.isfinite(inlier_rmse):
             rmse_delta = abs(prev_rmse - inlier_rmse)
         last_delta_rotation_deg, last_delta_translation_norm = transform_delta_metrics(step_transform)
         final_step = step
         if (
             step >= min_steps
+            and registration_valid
             and rmse_delta is not None
             and rmse_delta < float(rmse_tol)
             and last_delta_rotation_deg < float(rot_tol_deg)
@@ -908,6 +914,7 @@ def run_iterative_icp(
         transformation=total_transform,
         fitness=fitness,
         inlier_rmse=inlier_rmse,
+        registration_valid=registration_valid,
         final_step=final_step,
         converged=converged,
         rmse_delta=rmse_delta,
@@ -1021,6 +1028,7 @@ def run_icp_candidate(
         "T_A_C_initial": T_A_C_initial,
         "T_A_Aobs": T_A_Aobs,
         "T_A_C_refined": T_A_Aobs @ T_A_C_initial,
+        "registration_valid": fine_result.registration_valid,
         "converged": fine_result.converged,
         "final_step": final_step,
         "max_iteration": max_iteration_total,
@@ -1043,6 +1051,7 @@ def select_best_icp_candidate(candidates: list[dict[str, Any]]):
         if not math.isfinite(float(rmse)):
             rmse = float("inf")
         return (
+            0 if candidate["registration_valid"] else 1,
             0 if candidate["converged"] else 1,
             float(rmse),
             -float(candidate["fitness"]),
@@ -1055,6 +1064,7 @@ def select_best_icp_candidate(candidates: list[dict[str, Any]]):
 def candidate_score_summary(candidate: dict[str, Any]):
     return {
         "name": candidate["name"],
+        "registration_valid": candidate["registration_valid"],
         "converged": candidate["converged"],
         "final_step": candidate["final_step"],
         "coarse_step": candidate["coarse_step"],
@@ -1065,6 +1075,8 @@ def candidate_score_summary(candidate: dict[str, Any]):
         "rmse_delta": candidate["rmse_delta"],
         "last_delta_rotation_deg": candidate["last_delta_rotation_deg"],
         "last_delta_translation_norm": candidate["last_delta_translation_norm"],
+        "total_delta_rotation_deg": candidate["delta_rotation_deg"],
+        "total_delta_translation_norm": candidate["delta_translation_norm"],
     }
 
 
@@ -1092,6 +1104,7 @@ def run_pipeline(
     rmse_tol: float,
     rot_tol_deg: float,
     trans_tol: float,
+    icp_workers: int,
     n_points: int,
     t_ba_json: str,
     scale: float,
@@ -1131,12 +1144,18 @@ def run_pipeline(
             preview_view_json, mesh_a, fallback_T_A_C
         )
         append_log(logs, view_message)
-        T_A_C_initial = T_A_C_depth
         b_initial_mode = preview_state_value(preview_view_json, "b_initial_mode", "preview")
         if b_initial_mode == "xy_front":
-            T_A_C_initial = create_xy_front_camera_pose(mesh_a, float(distance))
+            candidate_specs = [{"name": "XY +Z", "pose": create_xy_front_camera_pose(mesh_a, float(distance))}]
+            use_coarse = True
             append_log(logs, f"CAD-B/ICP initial camera: xy_front distance_multiplier={float(distance):.4f}")
+        elif b_initial_mode == "six_view":
+            candidate_specs = create_six_view_camera_poses(mesh_a, float(distance))
+            use_coarse = True
+            append_log(logs, f"CAD-B/ICP initial camera: five_view candidates={len(candidate_specs)}")
         else:
+            candidate_specs = [{"name": "preview", "pose": T_A_C_depth}]
+            use_coarse = False
             append_log(logs, "CAD-B/ICP initial camera: preview")
 
         depth = render_depth(mesh_a, T_A_C_depth, K, int(width), int(height))
@@ -1147,83 +1166,60 @@ def run_pipeline(
         depth_image = depth_to_display_image(depth)
 
         P_obs_C = depth_to_pointcloud(depth, K, float(depth_scale))
-        P_obs_A = transform_pointcloud(P_obs_C, T_A_C_initial)
-        if any(abs(v) > 0 for v in (perturb_x, perturb_y, perturb_z)):
-            T_perturb = create_small_translation(float(perturb_x), float(perturb_y), float(perturb_z))
-            P_obs_A = transform_pointcloud(P_obs_A, T_perturb)
-            append_log(logs, f"applied observed-point perturbation: {[perturb_x, perturb_y, perturb_z]}")
-        append_log(logs, f"P_obs_A points={len(P_obs_A.points)} bounds={pointcloud_bounds(P_obs_A)}")
-
         P_cad_A = mesh_to_pointcloud(mesh_a, int(n_points))
-        source = preprocess_pointcloud(P_obs_A, float(voxel_size))
         target = preprocess_pointcloud(P_cad_A, float(voxel_size))
-        append_log(logs, f"source points after preprocess={len(source.points)}")
+        append_log(logs, f"P_obs_C points={len(P_obs_C.points)}")
         append_log(logs, f"target points after preprocess={len(target.points)}")
 
-        _, _, _, bbox_radius = mesh_bounds(mesh_a)
-        effective_trans_tol = float(trans_tol)
-        if effective_trans_tol <= 0:
-            effective_trans_tol = bbox_radius * 1e-4
-        max_iteration_total = max(1, int(max_iteration))
-        coarse_result = None
-        if b_initial_mode == "xy_front":
-            coarse_distance = max(float(max_correspondence_distance), bbox_radius * 1.5)
-            coarse_iterations = min(max(1, max_iteration_total // 2), max_iteration_total - 1)
-            if coarse_iterations > 0:
-                coarse_result = run_iterative_icp(
-                    source,
-                    target,
-                    coarse_distance,
-                    coarse_iterations,
-                    min_steps=1,
-                    rmse_tol=float(rmse_tol),
-                    rot_tol_deg=float(rot_tol_deg),
-                    trans_tol=effective_trans_tol,
-                    mode="point_to_point",
-                )
-                source = transform_pointcloud(source, coarse_result.transformation)
-                append_log(
-                    logs,
-                    "coarse ICP "
-                    f"step={coarse_result.final_step} distance={coarse_distance:.6f} "
-                    f"fitness={coarse_result.fitness:.6f} "
-                    f"inlier_rmse={coarse_result.inlier_rmse:.6f}",
-                )
-        remaining_iterations = max_iteration_total
-        if coarse_result is not None:
-            remaining_iterations = max(1, max_iteration_total - coarse_result.final_step)
-        fine_result = run_iterative_icp(
-            source,
-            target,
-            float(max_correspondence_distance),
-            remaining_iterations,
-            int(min_steps),
-            float(rmse_tol),
-            float(rot_tol_deg),
-            effective_trans_tol,
-            mode="point_to_plane",
-        )
-        if coarse_result is None:
-            T_A_Aobs = fine_result.transformation
-            final_step = fine_result.final_step
+        def _run_candidate(candidate):
+            return run_icp_candidate(
+                candidate["name"],
+                P_obs_C,
+                target,
+                mesh_a,
+                candidate["pose"],
+                float(voxel_size),
+                float(max_correspondence_distance),
+                int(max_iteration),
+                int(min_steps),
+                float(rmse_tol),
+                float(rot_tol_deg),
+                float(trans_tol),
+                use_coarse,
+                (float(perturb_x), float(perturb_y), float(perturb_z)),
+            )
+
+        worker_count = max(1, int(icp_workers))
+        if worker_count > 1 and len(candidate_specs) > 1:
+            candidate_results = [None] * len(candidate_specs)
+            with ThreadPoolExecutor(max_workers=min(worker_count, len(candidate_specs))) as executor:
+                futures = {
+                    executor.submit(_run_candidate, candidate): index
+                    for index, candidate in enumerate(candidate_specs)
+                }
+                for future in as_completed(futures):
+                    candidate_results[futures[future]] = future.result()
+            candidate_results = [candidate for candidate in candidate_results if candidate is not None]
         else:
-            T_A_Aobs = fine_result.transformation @ coarse_result.transformation
-            final_step = coarse_result.final_step + fine_result.final_step
+            candidate_results = [_run_candidate(candidate) for candidate in candidate_specs]
+        selected = select_best_icp_candidate(candidate_results)
+        T_A_C_initial = selected["T_A_C_initial"]
+        T_A_Aobs = selected["T_A_Aobs"]
+        T_A_C_refined = selected["T_A_C_refined"]
+        final_step = selected["final_step"]
         T_B_C_step0 = transfer_pose_to_cad_b(T_A_C_initial, T_BA, float(scale))
-        T_A_C_refined = T_A_Aobs @ T_A_C_initial
         T_B_C = transfer_pose_to_cad_b(T_A_C_refined, T_BA, float(scale))
-        delta_rotation_deg, delta_translation_norm = transform_delta_metrics(T_A_Aobs)
         append_log(
             logs,
-            f"ICP final_step={final_step} converged={fine_result.converged} "
-            f"fitness={fine_result.fitness:.6f} inlier_rmse={fine_result.inlier_rmse:.6f} "
-            f"rmse_delta={fine_result.rmse_delta} "
-            f"delta_rotation_deg={delta_rotation_deg:.6f} "
-            f"delta_translation_norm={delta_translation_norm:.6f}",
+            f"ICP selected={selected['name']} final_step={final_step} "
+            f"converged={selected['converged']} fitness={selected['fitness']:.6f} "
+            f"inlier_rmse={selected['inlier_rmse']:.6f}",
         )
 
         image_step0 = render_rgb(mesh_b, T_B_C_step0, K, int(width), int(height))
         image_final = render_rgb(mesh_b, T_B_C, K, int(width), int(height))
+        image_delta = np().asarray(image_step0, dtype=float) - np().asarray(image_final, dtype=float)
+        render_mean_abs_diff = float(np().mean(np().abs(image_delta)))
         pose = {
             "T_A_C_depth": matrix_to_list(T_A_C_depth),
             "T_A_C_initial": matrix_to_list(T_A_C_initial),
@@ -1235,23 +1231,33 @@ def run_pipeline(
             "K": matrix_to_list(K),
         }
         scores = {
-            "converged": fine_result.converged,
+            "selected_candidate": selected["name"],
+            "registration_valid": selected["registration_valid"],
+            "converged": selected["converged"],
             "final_step": final_step,
-            "max_iteration": max_iteration_total,
-            "coarse_step": coarse_result.final_step if coarse_result is not None else 0,
-            "fine_step": fine_result.final_step,
-            "stop_reason": "converged" if fine_result.converged else "max_iteration",
-            "fitness": fine_result.fitness,
-            "inlier_rmse": fine_result.inlier_rmse,
-            "rmse_delta": fine_result.rmse_delta,
-            "last_delta_rotation_deg": fine_result.last_delta_rotation_deg,
-            "last_delta_translation_norm": fine_result.last_delta_translation_norm,
+            "max_iteration": selected["max_iteration"],
+            "coarse_step": selected["coarse_step"],
+            "fine_step": selected["fine_step"],
+            "stop_reason": selected["stop_reason"],
+            "fitness": selected["fitness"],
+            "inlier_rmse": selected["inlier_rmse"],
+            "rmse_delta": selected["rmse_delta"],
+            "last_delta_rotation_deg": selected["last_delta_rotation_deg"],
+            "last_delta_translation_norm": selected["last_delta_translation_norm"],
+            "total_delta_rotation_deg": selected["delta_rotation_deg"],
+            "total_delta_translation_norm": selected["delta_translation_norm"],
+            "render_mean_abs_diff": render_mean_abs_diff,
+            "render_changed": render_mean_abs_diff > 1e-6,
             "initial_mode": b_initial_mode,
+            "icp_workers": min(worker_count, len(candidate_specs)),
+            "candidates": [candidate_score_summary(candidate) for candidate in candidate_results],
         }
         return PipelineResult(
             image_step0=image_step0,
             image_final=image_final,
             final_step=final_step,
+            selected_candidate=str(selected["name"]),
+            total_delta_rotation_deg=float(selected["delta_rotation_deg"]),
             depth_image=depth_image,
             pose_json=_json_dumps(pose),
             score_json=_json_dumps(scores),
@@ -1263,6 +1269,8 @@ def run_pipeline(
             image_step0=None,
             image_final=None,
             final_step=0,
+            selected_candidate="error",
+            total_delta_rotation_deg=0.0,
             depth_image=None,
             pose_json="{}",
             score_json="{}",
@@ -1301,8 +1309,8 @@ def run_self_test(mesh_path: str | None = None) -> int:
         if point_count != 256:
             raise AssertionError(f"Unexpected sampled point count: {point_count}")
         six_views = create_six_view_camera_poses(mesh)
-        if len(six_views) != 6:
-            raise AssertionError(f"Unexpected six-view candidate count: {len(six_views)}")
+        if len(six_views) != 5:
+            raise AssertionError(f"Unexpected five-view candidate count: {len(six_views)}")
         for candidate in six_views:
             if np().asarray(candidate["pose"]).shape != (4, 4):
                 raise AssertionError(f"Invalid pose shape for {candidate['name']}")
@@ -1350,6 +1358,7 @@ def build_gradio_app():
                         rmse_tol = gr.Number(label="rmse_tol", value=1e-5)
                         rot_tol_deg = gr.Number(label="rot_tol_deg", value=0.05)
                         trans_tol = gr.Number(label="trans_tol (0=auto)", value=0.0)
+                    icp_workers = gr.Number(label="icp_workers", value=4, precision=0)
                     n_points = gr.Number(label="cad sample points", value=20000, precision=0)
                 with gr.Accordion("Transfer and debug", open=False):
                     t_ba_json = gr.Textbox(
@@ -1366,6 +1375,7 @@ def build_gradio_app():
                 with gr.Row():
                     start = gr.Button("Start", variant="primary")
                     start_xy_front = gr.Button("Run XY Front ICP")
+                    start_six_view = gr.Button("Run 5-View ICP")
             with gr.Column():
                 cad_b_file = gr.File(label="CAD-B")
                 with gr.Row():
@@ -1399,6 +1409,7 @@ def build_gradio_app():
             rmse_tol,
             rot_tol_deg,
             trans_tol,
+            icp_workers,
             n_points,
             t_ba_json,
             scale,
@@ -1410,10 +1421,14 @@ def build_gradio_app():
 
         def _run(*values):
             result = run_pipeline(*values)
+            final_label = (
+                f"CAD-B Final (Step={result.final_step}, "
+                f"{result.selected_candidate}, Δrot={result.total_delta_rotation_deg:.2f}°)"
+            )
             return (
                 result.depth_image,
                 result.image_step0,
-                gr.update(value=result.image_final, label=f"CAD-B Final (Step={result.final_step})"),
+                gr.update(value=result.image_final, label=final_label),
                 result.pose_json,
                 result.score_json,
                 result.log,
@@ -1470,6 +1485,9 @@ def build_gradio_app():
         capture_preview_camera_xy_front_js = capture_preview_camera_js.replace(
             'b_initial_mode: "preview"', 'b_initial_mode: "xy_front"'
         )
+        capture_preview_camera_six_view_js = capture_preview_camera_js.replace(
+            'b_initial_mode: "preview"', 'b_initial_mode: "six_view"'
+        )
 
         cad_a_file.change(update_cad_a_preview, inputs=[cad_a_file], outputs=[cad_a_plot, log])
         start.click(
@@ -1483,6 +1501,12 @@ def build_gradio_app():
             inputs=inputs,
             outputs=[cad_a_depth, image_step0, image_final, pose_json, score_json, log],
             js=capture_preview_camera_xy_front_js,
+        )
+        start_six_view.click(
+            _run,
+            inputs=inputs,
+            outputs=[cad_a_depth, image_step0, image_final, pose_json, score_json, log],
+            js=capture_preview_camera_six_view_js,
         )
     return demo
 
@@ -1517,12 +1541,39 @@ def kill_existing_listeners(port: int) -> list[int]:
     return pids
 
 
+def launch_gradio_app(demo, host: str, port: int, port_search_count: int, kill_existing: bool) -> int:
+    first_port = int(port)
+    attempts = max(1, int(port_search_count))
+    for candidate_port in range(first_port, first_port + attempts):
+        if kill_existing:
+            killed = kill_existing_listeners(candidate_port)
+            if killed:
+                print(f"Stopped existing listener(s) on port {candidate_port}: {killed}", flush=True)
+        local_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
+        print(f"Launching Gradio on {host}:{candidate_port}", flush=True)
+        print(f"Local URL: http://{local_host}:{candidate_port}", flush=True)
+        try:
+            demo.launch(server_name=host, server_port=candidate_port, show_error=True)
+            return candidate_port
+        except OSError as exc:
+            if "Cannot find empty port" not in str(exc) or candidate_port == first_port + attempts - 1:
+                raise
+            print(f"Port {candidate_port} is unavailable; trying {candidate_port + 1}.", file=sys.stderr, flush=True)
+    raise RuntimeError("No available Gradio port found.")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="CAD-A Depth ICP to CAD-B same-view Gradio MVP.")
     parser.add_argument("--self-test", action="store_true", help="Run lightweight self tests.")
     parser.add_argument("--mesh", help="Optional mesh path for self-test loading.")
-    parser.add_argument("--host", default="127.0.0.1", help="Gradio server host.")
-    parser.add_argument("--port", type=int, default=7865, help="Gradio server port.")
+    parser.add_argument("--host", default="0.0.0.0", help="Gradio server host.")
+    parser.add_argument("--port", type=int, default=7866, help="Gradio server port.")
+    parser.add_argument(
+        "--port-search-count",
+        type=int,
+        default=10,
+        help="Number of consecutive ports to try when the selected port is busy.",
+    )
     parser.add_argument(
         "--no-kill-existing",
         action="store_true",
@@ -1533,13 +1584,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.self_test:
         return run_self_test(args.mesh)
 
-    if not args.no_kill_existing:
-        killed = kill_existing_listeners(args.port)
-        if killed:
-            print(f"Stopped existing listener(s) on port {args.port}: {killed}")
-
     demo = build_gradio_app()
-    demo.launch(server_name=args.host, server_port=args.port)
+    launch_gradio_app(
+        demo,
+        host=args.host,
+        port=args.port,
+        port_search_count=args.port_search_count,
+        kill_existing=not args.no_kill_existing,
+    )
     return 0
 
 
